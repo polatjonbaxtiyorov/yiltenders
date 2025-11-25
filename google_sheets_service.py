@@ -72,14 +72,33 @@ class GoogleSheetsService:
             True if authentication successful, False otherwise
         """
         try:
-            if not self.credentials_path.exists():
-                logger.error(f"Credentials file not found: {self.credentials_path}")
+            # Try to use environment variable first (for Railway/cloud deployment)
+            google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+            
+            if google_creds_json:
+                logger.info("Using Google credentials from environment variable")
+                try:
+                    credentials_info = json.loads(google_creds_json)
+                    credentials = Credentials.from_service_account_info(
+                        credentials_info,
+                        scopes=SCOPES
+                    )
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+                    return False
+            # Fall back to file-based credentials (for local development)
+            elif self.credentials_path.exists():
+                logger.info(f"Using Google credentials from file: {self.credentials_path}")
+                credentials = Credentials.from_service_account_file(
+                    str(self.credentials_path),
+                    scopes=SCOPES
+                )
+            else:
+                logger.error(
+                    "No Google credentials found. Set GOOGLE_CREDENTIALS_JSON environment variable "
+                    f"or provide credentials file at: {self.credentials_path}"
+                )
                 return False
-                
-            credentials = Credentials.from_service_account_file(
-                str(self.credentials_path),
-                scopes=SCOPES
-            )
             
             self._client = gspread.authorize(credentials)
             logger.info("Successfully authenticated with Google Sheets API")
@@ -276,10 +295,11 @@ class GoogleSheetsService:
         Returns:
             True if credentials and spreadsheet ID are available
         """
-        return (
-            self.credentials_path.exists() and 
-            self.spreadsheet_id is not None
+        has_credentials = (
+            os.getenv("GOOGLE_CREDENTIALS_JSON") is not None or 
+            self.credentials_path.exists()
         )
+        return has_credentials and self.spreadsheet_id is not None
 
 
 def create_sample_credentials_file() -> None:
