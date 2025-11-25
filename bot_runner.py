@@ -557,7 +557,13 @@ def _parse_chat_ids(raw: Optional[str]) -> List[str]:
 
 
 def _resolve_settings(args: argparse.Namespace) -> Tuple[str, str, List[str]]:
-    token = args.token or os.getenv("TELEGRAM_BOT_TOKEN") or DEFAULT_BOT_TOKEN
+    token = args.token or os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise ValueError(
+            "Telegram bot token is required. "
+            "Set TELEGRAM_BOT_TOKEN environment variable or use --token argument."
+        )
+    
     password = args.password or os.getenv("TENDER_BOT_PASSWORD") or DEFAULT_ACCESS_PASSWORD
     seed_chats = _parse_chat_ids(args.chat_ids or os.getenv("TELEGRAM_CHAT_IDS"))
     return token, password, seed_chats
