@@ -1,0 +1,19 @@
+{
+  "sent_ids": [
+    "25411012209303"
+  ],
+  "records": {
+    "25411012209303": {
+      "tender_id": 209303,
+      "name": "Нурафшон шахар Янгиобод махалласи худудида жойлашган 48-мактабга олиб борувчи йўлни таъмирлаш",
+      "unique_name": "25411012209303",
+      "start_price": "30000000",
+      "required_percent": "1",
+      "placement_term": "2025-11-28 23:59:59",
+      "complexity_category_id": 2,
+      "end_term_work_days": 15,
+      "customer_name": "TOSHKENT VILOYATI MINTAQAVIY YO`LLARGA BUYURTMACHI XIZMATI",
+      "address": "Тошкент вилояти Нурафшон шаҳри"
+    }
+  }
+}
