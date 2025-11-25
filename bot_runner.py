@@ -557,7 +557,12 @@ def _parse_chat_ids(raw: Optional[str]) -> List[str]:
 
 
 def _resolve_settings(args: argparse.Namespace) -> Tuple[str, str, List[str]]:
-    token = args.token or os.getenv("TELEGRAM_BOT_TOKEN")
+    # Debug: Check if environment variables are accessible
+    token_from_env = os.getenv("TELEGRAM_BOT_TOKEN")
+    logging.info(f"TELEGRAM_BOT_TOKEN from env: {'Found' if token_from_env else 'NOT FOUND'}")
+    logging.info(f"Available env vars: {', '.join([k for k in os.environ.keys() if 'TELEGRAM' in k or 'GOOGLE' in k])}")
+    
+    token = args.token or token_from_env
     if not token:
         raise ValueError(
             "Telegram bot token is required. "
@@ -573,6 +578,20 @@ def main() -> None:
     """Main entry point for the bot."""
     args = _parse_args()
     _configure_logging(args.debug)
+    
+    # Debug: Print all environment variables to diagnose Railway issue
+    print("=" * 70)
+    print("ENVIRONMENT VARIABLES DEBUG")
+    print("=" * 70)
+    print(f"Total env vars: {len(os.environ)}")
+    print("\nRelevant variables:")
+    for key in sorted(os.environ.keys()):
+        if any(term in key.upper() for term in ['TELEGRAM', 'GOOGLE', 'TENDER', 'BOT', 'TOKEN']):
+            # Mask sensitive values
+            value = os.environ[key]
+            masked = value[:10] + "..." if len(value) > 10 else "***"
+            print(f"  {key} = {masked}")
+    print("=" * 70)
 
     token, password, seed_chat_ids = _resolve_settings(args)
 
