@@ -213,21 +213,22 @@ class GoogleSheetsService:
             for tender in tenders:
                 # Determine real numeric id if present
                 real_id = ""
-                if getattr(tender, "tender_id", None):
+                if getattr(tender, "tender_id", None) is not None:
                     real_id = str(getattr(tender, "tender_id"))
                 elif getattr(tender, "unique_name", None):
-                    # fallback to unique_name if tender_id missing
                     real_id = str(getattr(tender, "unique_name"))
-
-                display_text = real_id or tender.name or ""
-
-                # Build link using last 6 digits of the real id (if any)
+                
+                # Build URL using last 6 digits but display FULL real_id
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    full_link = f"{base_url}{last6}/view"
-                    tender_link = f'=HYPERLINK("{full_link}", "{real_id}")'
+                    url = f"https://tender.mc.uz/tender-list/tender/{last6}/view"
+                
+                    # Escape quotes just in case
+                    safe_display = real_id.replace('"', '""')
+                
+                    tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
                 else:
-                    tender_link = real_id
+                    tender_link = ""
 
                 # Convert start_price to Decimal when possible
                 start_price_decimal: Optional[Decimal] = None
@@ -322,7 +323,7 @@ class GoogleSheetsService:
             for tender in tenders:
                 # Determine real numeric id if present
                 real_id = ""
-                if getattr(tender, "tender_id", None):
+                if getattr(tender, "tender_id", None) is not None:
                     real_id = str(getattr(tender, "tender_id"))
                 elif getattr(tender, "unique_name", None):
                     real_id = str(getattr(tender, "unique_name"))
@@ -333,13 +334,17 @@ class GoogleSheetsService:
 
                 display_text = real_id or tender.name or ""
 
-                # Build link using last 6 digits of the real id (if any)
+                # Build URL using last 6 digits but display FULL real_id
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    full_link = f"{base_url}{last6}/view"
-                    tender_link = f'=HYPERLINK("{full_link}", "{real_id}")'
+                    url = f"https://tender.mc.uz/tender-list/tender/{last6}/view"
+                
+                    # Escape quotes just in case
+                    safe_display = real_id.replace('"', '""')
+                
+                    tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
                 else:
-                    tender_link = real_id
+                    tender_link = ""
 
                 start_price_decimal: Optional[Decimal] = None
                 if tender.start_price:
