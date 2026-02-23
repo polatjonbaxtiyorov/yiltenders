@@ -112,77 +112,73 @@ class GoogleSheetsService:
             logger.exception("Unexpected error during authentication: %s", e)
             return False
 
-    def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
-        """Completely replace all data in sheet with fresh tenders.
+   def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
+    """Completely replace all data in sheet with fresh tenders."""
 
-        This clears existing data (keeping header row) and appends all provided tenders.
-        """
-        worksheet = self._get_worksheet()
-        if not worksheet:
-            return False
+    worksheet = self._get_worksheet()
+    if not worksheet:
+        return False
 
-        try:
-            # Clear all data (except header) and re-write header to be safe
-            try:
-                worksheet.batch_clear([_CLEAR_RANGE])
-            except Exception:
-                # Some accounts / worksheet states may not allow batch_clear; fall back to clear()
+    try:
+        # Clear all data except header
+        worksheet.batch_clear(["A2:J1000"])
+
+        # Rewrite header row (safety)
+        worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
+
+        base_url = "https://tender.mc.uz/tender-list/tender/"
+
+        new_rows = []
+
+        for tender in tenders:
+            tender_id = tender.unique_name or ""
+
+            # Create clickable hyperlink
+            if tender_id:
+                tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
+            else:
+                tender_link = ""
+
+            # Convert start_price to Decimal
+            start_price_decimal = None
+            if tender.start_price:
                 try:
-                    worksheet.clear()
-                except Exception:
-                    logger.warning("Failed to clear worksheet cleanly; continuing to attempt to write anyway")
+                    start_price_decimal = Decimal(str(tender.start_price))
+                except (ValueError, TypeError):
+                    start_price_decimal = None
 
-            # Ensure header exists (overwrite first row)
-            try:
-                worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
-            except Exception:
-                # Fallback append if update fails
-                try:
-                    worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
-                except Exception:
-                    logger.warning("Failed to write header row; continuing")
+            discount_percent = None
+            final_price = None
 
-            new_rows = []
+            if start_price_decimal and getattr(tender, "required_percent", None):
+                discount_percent = _discount_percent(start_price_decimal)
+                if discount_percent:
+                    final_price = start_price_decimal - (start_price_decimal * discount_percent)
 
-            for tender in tenders:
-                # Convert start_price to Decimal when possible
-                start_price_decimal = None
-                if tender.start_price:
-                    try:
-                        start_price_decimal = Decimal(str(tender.start_price))
-                    except (ValueError, TypeError):
-                        start_price_decimal = None
+            row = [
+                tender_link,
+                tender.name or "",
+                tender.address or "",
+                tender.start_price or "",
+                str(discount_percent) if discount_percent else "",
+                str(final_price) if final_price else "",
+                str(tender.complexity_category_id) if getattr(tender, "complexity_category_id", None) else "",
+                tender.placement_term or "",
+                str(tender.end_term_work_days) if getattr(tender, "end_term_work_days", None) else "",
+                tender.customer_name or "",
+            ]
 
-                discount_percent = None
-                final_price = None
-                if start_price_decimal and getattr(tender, "required_percent", None):
-                    discount_percent = _discount_percent(start_price_decimal)
-                    if discount_percent:
-                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
+            new_rows.append(row)
 
-                row = [
-                    tender.unique_name or "",
-                    tender.name or "",
-                    tender.address or "",
-                    tender.start_price or "",
-                    str(discount_percent) if discount_percent else "",
-                    str(final_price) if final_price else "",
-                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
-                    tender.placement_term or "",
-                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
-                    tender.customer_name or "",
-                ]
-                new_rows.append(row)
+        if new_rows:
+            worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
 
-            if new_rows:
-                # append_rows expects list of rows
-                worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-            logger.info("Replaced sheet with %d tenders", len(new_rows))
-            return True
+        logger.info(f"Replaced sheet with {len(new_rows)} tenders")
+        return True
 
-        except Exception as e:
-            logger.exception("Error replacing sheet data: %s", e)
-            return False
+    except Exception as e:
+        logger.error(f"Error replacing sheet data: {e}")
+        return False
 
     def _get_worksheet(self) -> Optional[gspread.Worksheet]:
         """Get or create the worksheet.
@@ -247,89 +243,90 @@ class GoogleSheetsService:
             logger.exception("Full exception details:")
             return None
 
-    def add_tenders(self, tenders: List[TenderSummary]) -> bool:
-        """Add new tender data to the spreadsheet.
+   def add_tenders(self, tenders: List[TenderSummary]) -> bool:
+    """Add new tender data to the spreadsheet."""
 
-        Args:
-            tenders: List of TenderSummary objects to add
+    if not tenders:
+        logger.info("No tenders to add to spreadsheet")
+        return True
 
-        Returns:
-            True if successful, False otherwise
-        """
-        if not tenders:
-            logger.info("No tenders to add to spreadsheet")
+    worksheet = self._get_worksheet()
+    if not worksheet:
+        return False
+
+    try:
+        # Fetch existing IDs (column A)
+        existing_ids = set()
+        try:
+            existing_data = worksheet.get_all_values()[1:]
+            for row in existing_data:
+                if row and row[0]:
+                    # Extract ID from HYPERLINK formula if present
+                    if "HYPERLINK" in row[0]:
+                        # Extract text between last quotes
+                        parts = row[0].split('"')
+                        if len(parts) >= 4:
+                            existing_ids.add(parts[3])
+                    else:
+                        existing_ids.add(row[0])
+        except Exception as e:
+            logger.warning(f"Could not fetch existing data: {e}")
+
+        base_url = "https://tender.mc.uz/tender-list/tender/"
+        new_rows = []
+
+        for tender in tenders:
+            tender_id = tender.unique_name or ""
+
+            if tender_id and tender_id in existing_ids:
+                continue
+
+            if tender_id:
+                tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
+            else:
+                tender_link = ""
+
+            start_price_decimal = None
+            if tender.start_price:
+                try:
+                    start_price_decimal = Decimal(str(tender.start_price))
+                except (ValueError, TypeError):
+                    start_price_decimal = None
+
+            discount_percent = None
+            final_price = None
+
+            if start_price_decimal and getattr(tender, "required_percent", None):
+                discount_percent = _discount_percent(start_price_decimal)
+                if discount_percent:
+                    final_price = start_price_decimal - (start_price_decimal * discount_percent)
+
+            row = [
+                tender_link,
+                tender.name or "",
+                tender.address or "",
+                tender.start_price or "",
+                str(discount_percent) if discount_percent else "",
+                str(final_price) if final_price else "",
+                str(tender.complexity_category_id) if getattr(tender, "complexity_category_id", None) else "",
+                tender.placement_term or "",
+                str(tender.end_term_work_days) if getattr(tender, "end_term_work_days", None) else "",
+                tender.customer_name or "",
+            ]
+
+            new_rows.append(row)
+
+        if not new_rows:
+            logger.info("No new tenders to add")
             return True
 
-        worksheet = self._get_worksheet()
-        if not worksheet:
-            return False
+        worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+        logger.info(f"Added {len(new_rows)} new tenders to spreadsheet")
+        return True
 
-        try:
-            # Get existing tender IDs to avoid duplicates (skip header)
-            existing_ids = set()
-            try:
-                existing_data = worksheet.get_all_values()[1:]  # Skip header
-                existing_ids = {row[0] for row in existing_data if row and row[0]}
-            except Exception as e:
-                logger.warning("Could not fetch existing data: %s", e)
-
-            # Prepare new rows
-            new_rows = []
-            logger.info("Preparing to add %d tenders", len(tenders))
-            for tender in tenders:
-                tender_id = str(getattr(tender, "tender_id", "")) if getattr(tender, "tender_id", None) else (tender.unique_name or "")
-                logger.debug("Tender: ID=%s, Name=%s", tender_id, tender.name)
-
-                # Skip if already exists
-                if tender_id and tender_id in existing_ids:
-                    continue
-
-                # Convert start_price to Decimal for calculations
-                start_price_decimal = None
-                if tender.start_price:
-                    try:
-                        start_price_decimal = Decimal(str(tender.start_price))
-                    except (ValueError, TypeError):
-                        start_price_decimal = None
-
-                # Calculate discount and final price
-                discount_percent = None
-                final_price = None
-                if start_price_decimal and getattr(tender, "required_percent", None):
-                    discount_percent = _discount_percent(start_price_decimal)
-                    if discount_percent:
-                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
-
-                row = [
-                    tender.unique_name or "",
-                    tender.name or "",
-                    tender.address or "",
-                    tender.start_price or "",
-                    str(discount_percent) if discount_percent else "",
-                    str(final_price) if final_price else "",
-                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
-                    tender.placement_term or "",
-                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
-                    tender.customer_name or "",
-                ]
-                new_rows.append(row)
-
-            if not new_rows:
-                logger.info("No new tenders to add (all already exist)")
-                return True
-
-            # Add new rows to spreadsheet
-            try:
-                worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-                logger.info("Added %d new tenders to spreadsheet", len(new_rows))
-                return True
-            except Exception as e:
-                logger.exception("FAILED to append rows: %s", e)
-                return False
-
-        except Exception as e:
-            logger.exception("Error adding tenders to spreadsheet: %s", e)
-            return False
+    except Exception as e:
+        logger.error(f"Error adding tenders to spreadsheet: {e}")
+        return False
 
     def get_tender_count(self) -> int:
         """Get the total number of tenders in the spreadsheet.
