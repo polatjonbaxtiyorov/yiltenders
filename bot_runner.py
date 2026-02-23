@@ -23,9 +23,10 @@ PASSWORD_PROMPT = "🔐 Iltimos, parolni kiriting."
 
 # Command constants
 COMMAND_SENDALL = "/sendall"
-COMMAND_REFRESH = "/refresh" 
+COMMAND_REFRESH = "/refresh"
 COMMAND_STATUS = "/status"
 COMMAND_HELP = "/help"
+COMMAND_SYNCALL = "/sync_all"     # <--- new command
 
 
 def get_help_message(has_sheets: bool = False) -> str:
@@ -38,6 +39,7 @@ def get_help_message(has_sheets: bool = False) -> str:
     
     if has_sheets:
         msg += "\n/status - Google Sheets holati"
+        msg += "\n/sync_all - Google Sheets ni to'liq qayta sinxronizatsiya qilish (barcha tenderlarni yuklash)"
     
     return msg
 
@@ -378,11 +380,14 @@ class TelegramUpdatePoller:
             self._handle_refresh_command(chat_id)
         elif text == COMMAND_STATUS and self._has_sheets:
             self._send_sheets_status(chat_id)
+        elif text == COMMAND_SYNCALL and self._has_sheets:
+            # New handler for /sync_all
+            self._handle_sync_all(chat_id)
         elif text == COMMAND_HELP or text.startswith("/"):
             self._send_help(chat_id)
         else:
             self._send_help(chat_id)
-    
+
     def _handle_refresh_command(self, chat_id: str) -> None:
         """Handle the /refresh command to fetch new tenders."""
         count = fetch_and_send(
@@ -401,7 +406,65 @@ class TelegramUpdatePoller:
             message = "ℹ️ Yangi tenderlar topilmadi."
         
         self._notifier.send_messages([chat_id], [message])
-    
+
+    def _handle_sync_all(self, chat_id: str) -> None:
+        """Handle the /sync_all command: fetch ALL tenders and push to Google Sheets."""
+        # Security: ensure registered (we already only reach here if registered) and sheets enabled
+        if not self._sheets_service:
+            self._notifier.send_messages([chat_id], ["❌ Google Sheets integratsiyasi o'chirilgan. --enable-sheets bilan ishga tushiring."])
+            return
+        if not self._sheets_service.is_configured():
+            self._notifier.send_messages([chat_id], ["❌ Google Sheets sozlanmagan: kredensial yoki spreadsheet ID topilmadi."])
+            return
+
+        # Notify start
+        self._notifier.send_messages([chat_id], ["🔄 To'liq sinxronizatsiya boshlanmoqda — barcha tenderlarni yuklayman..."])
+        try:
+            # Try to get all tenders; fall back to fetch_required_batches() if get_all_tenders not present
+            try:
+                all_tenders = self._service.get_all_tenders()
+            except AttributeError:
+                # fetch_required_batches returns (summaries, metadata) in your code earlier; handle both
+                result = self._service.fetch_required_batches()
+                if isinstance(result, tuple) and result:
+                    all_tenders = result[0]
+                else:
+                    all_tenders = result
+
+            # If fetch returned a tuple or (summaries, something), normalize
+            if isinstance(all_tenders, tuple) and len(all_tenders) > 0:
+                all_tenders = all_tenders[0]
+
+            if not all_tenders:
+                self._notifier.send_messages([chat_id], ["ℹ️ Tenderlar topilmadi — sinxronizatsiya bekor qilindi."])
+                return
+
+            count = len(all_tenders)
+            self._notifier.send_messages([chat_id], [f"📥 {count} ta tender topildi. Google Sheets yangilanadi..."])
+
+            # If service supports replace_all_tenders, use it (preferred). Otherwise clear & add.
+            try:
+                if hasattr(self._sheets_service, "replace_all_tenders"):
+                    ok = self._sheets_service.replace_all_tenders(all_tenders)
+                else:
+                    # Clear existing data then add all (add_tenders has dedupe, but sheet is cleared so will append)
+                    try:
+                        self._sheets_service.clear_all_data()
+                    except Exception:
+                        logging.warning("clear_all_data() failed or not available; attempting to continue")
+                    ok = self._sheets_service.add_tenders(all_tenders)
+            except Exception as e:
+                logging.exception("Failed to write to Google Sheets during full sync: %s", e)
+                ok = False
+
+            if ok:
+                self._notifier.send_messages([chat_id], ["✅ To'liq sinxronizatsiya muvaffaqiyatli yakunlandi. Google Sheets yangilandi."])
+            else:
+                self._notifier.send_messages([chat_id], ["❌ Sinxronizatsiya muvaffaqiyatsiz. Jurnallarni tekshiring."])
+        except Exception as e:
+            logging.exception("Error during /sync_all: %s", e)
+            self._notifier.send_messages([chat_id], [f"❌ Xatolik yuz berdi: {str(e)}"])
+
     def _send_help(self, chat_id: str) -> None:
         """Send help message to user."""
         help_msg = get_help_message(self._has_sheets)
