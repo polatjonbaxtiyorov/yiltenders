@@ -202,10 +202,11 @@ class GoogleSheetsService:
             # Prepare new rows
             new_rows = []
             current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
+
+            logger.info(f"Preparing to add {len(tenders)} tenders")
             for tender in tenders:
-                tender_id = str(tender.tender_id) if tender.tender_id else tender.unique_name or ""
-                
+                logger.debug(f"Tender: ID={tender.tender_id}, Name={tender.name}")
+               
                 # Skip if already exists
                 if tender_id and tender_id in existing_ids:
                     continue
