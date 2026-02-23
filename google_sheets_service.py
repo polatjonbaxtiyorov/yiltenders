@@ -3,10 +3,10 @@
 This module provides functionality to automatically update Google Sheets
 with new tender data at regular intervals.
 
-Revisions:
-- Hyperlink in column A will display the full tender ID (if available)
-  but the URL path will use the **last 6 digits** of the ID as requested,
-  e.g. display "26411012225390" but link to ".../225390/view".
+Behavior:
+- Column A will contain formulas like:
+  =HYPERLINK("https://tender.mc.uz/tender-list/tender/225390/view","26411012225390")
+  (URL uses last 6 digits, display shows full ID)
 """
 
 from __future__ import annotations
@@ -59,13 +59,6 @@ class GoogleSheetsService:
         spreadsheet_id: Optional[str] = None,
         worksheet_name: str = "Tenders",
     ) -> None:
-        """Initialize Google Sheets service.
-
-        Args:
-            credentials_path: Path to service account JSON credentials file
-            spreadsheet_id: Google Sheets spreadsheet ID (optional; falls back to env var)
-            worksheet_name: Name of the worksheet to use
-        """
         self.credentials_path = Path(credentials_path) if credentials_path else Path("google_credentials.json")
         self.spreadsheet_id = (
             spreadsheet_id
@@ -77,11 +70,7 @@ class GoogleSheetsService:
         self._worksheet: Optional[gspread.Worksheet] = None
 
     def _authenticate(self) -> bool:
-        """Authenticate with Google Sheets API.
-
-        Returns:
-            True if authentication successful, False otherwise
-        """
+        """Authenticate with Google Sheets API."""
         try:
             google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
@@ -116,11 +105,7 @@ class GoogleSheetsService:
             return False
 
     def _get_worksheet(self) -> Optional[gspread.Worksheet]:
-        """Get or create the worksheet.
-
-        Returns:
-            Worksheet object or None if failed
-        """
+        """Get or create the worksheet."""
         if not self._client:
             if not self._authenticate():
                 return None
@@ -133,12 +118,10 @@ class GoogleSheetsService:
             logger.debug("Using spreadsheet ID: %s", self.spreadsheet_id)
             spreadsheet = self._client.open_by_key(self.spreadsheet_id)
 
-            # Try to get existing worksheet
             try:
                 worksheet = spreadsheet.worksheet(self.worksheet_name)
                 logger.info("Found existing worksheet: %s", self.worksheet_name)
             except gspread.WorksheetNotFound:
-                # Create new worksheet
                 worksheet = spreadsheet.add_worksheet(title=self.worksheet_name, rows=1000, cols=len(HEADERS))
                 logger.info("Created new worksheet: %s", self.worksheet_name)
                 try:
@@ -155,11 +138,9 @@ class GoogleSheetsService:
             return None
         except Exception as e:
             error_msg = str(e)
-            error_type = type(e).__name__
-            logger.error("Error accessing worksheet: %s: %s", error_type, error_msg)
-
+            logger.error("Error accessing worksheet: %s", error_msg)
             if "403" in error_msg or "Forbidden" in error_msg:
-                logger.error("Permission denied. Please share the spreadsheet with the service account.")
+                logger.error("Permission denied. Share the spreadsheet with the service account.")
                 try:
                     if self.credentials_path.exists():
                         with open(self.credentials_path, "r", encoding="utf-8") as f:
@@ -167,22 +148,11 @@ class GoogleSheetsService:
                             service_email = creds.get("client_email", "unknown")
                             logger.error("Service account email: %s", service_email)
                 except Exception:
-                    logger.debug("Could not read credentials file to show service account email")
-            elif "404" in error_msg:
-                logger.error("Spreadsheet not found. Check the spreadsheet ID.")
-            else:
-                logger.debug("Unhandled error while accessing spreadsheet")
-
-            logger.exception("Full exception details:")
+                    logger.debug("Could not read credentials file for service account email")
             return None
 
     def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
-        """Completely replace all data in sheet with fresh tenders.
-
-        This clears existing data (keeping header row) and appends all provided tenders.
-        The hyperlink in column A will display the full ID (if available) but the URL
-        will use the last 6 digits of that ID in the path as requested.
-        """
+        """Completely replace all data in sheet with fresh tenders."""
         worksheet = self._get_worksheet()
         if not worksheet:
             return False
@@ -192,13 +162,12 @@ class GoogleSheetsService:
             try:
                 worksheet.batch_clear([_CLEAR_RANGE])
             except Exception:
-                # Fall back to clear if batch_clear not allowed in some states
                 try:
                     worksheet.clear()
                 except Exception:
-                    logger.warning("Failed to clear worksheet cleanly; continuing to attempt to write anyway")
+                    logger.warning("Failed to clear worksheet cleanly; continuing")
 
-            # Ensure header exists (overwrite first row)
+            # Ensure header exists
             try:
                 worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
             except Exception:
@@ -211,26 +180,26 @@ class GoogleSheetsService:
             new_rows: List[List[str]] = []
 
             for tender in tenders:
-                # Determine real numeric id if present
+                # --- determine real_id (FULL ID) ---
                 real_id = ""
                 if getattr(tender, "tender_id", None) is not None:
                     real_id = str(getattr(tender, "tender_id"))
                 elif getattr(tender, "unique_name", None):
                     real_id = str(getattr(tender, "unique_name"))
-                
-                # Build URL using last 6 digits but display FULL real_id
+
+                # Build URL with last6 but display full real_id
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    url = f"https://tender.mc.uz/tender-list/tender/{last6}/view"
-                
-                    # Escape quotes just in case
+                    url = f"{base_url}{last6}/view"
                     safe_display = real_id.replace('"', '""')
-                
                     tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
                 else:
                     tender_link = ""
 
-                # Convert start_price to Decimal when possible
+                # Debug: log what we write for the first few tenders (or all in debug)
+                logger.debug("Prepared tender_link: %s", tender_link)
+
+                # Price / discount handling
                 start_price_decimal: Optional[Decimal] = None
                 if tender.start_price:
                     try:
@@ -261,15 +230,16 @@ class GoogleSheetsService:
 
             if new_rows:
                 worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+                logger.info("Appended %d rows to sheet", len(new_rows))
+            else:
+                logger.info("No rows to append")
 
-            # Sanity check: log number of rows now present
             try:
                 total_rows = len(worksheet.get_all_values())
                 logger.info("Sheet now contains %d rows (including header)", total_rows)
             except Exception:
                 logger.debug("Could not fetch sheet row count after replace")
 
-            logger.info("Replaced sheet with %d tenders", len(new_rows))
             return True
 
         except Exception as e:
@@ -277,14 +247,7 @@ class GoogleSheetsService:
             return False
 
     def add_tenders(self, tenders: List[TenderSummary]) -> bool:
-        """Add new tender data to the spreadsheet.
-
-        Args:
-            tenders: List of TenderSummary objects to add
-
-        Returns:
-            True if successful, False otherwise
-        """
+        """Add new tender data to the spreadsheet."""
         if not tenders:
             logger.info("No tenders to add to spreadsheet")
             return True
@@ -294,10 +257,10 @@ class GoogleSheetsService:
             return False
 
         try:
-            # Fetch existing IDs (column A), try to handle HYPERLINK formulas
+            # Read existing display IDs from column A (handle HYPERLINK formulas)
             existing_ids = set()
             try:
-                existing_data = worksheet.get_all_values()[1:]  # Skip header row
+                existing_data = worksheet.get_all_values()[1:]  # skip header
                 for row in existing_data:
                     if not row:
                         continue
@@ -305,7 +268,7 @@ class GoogleSheetsService:
                     if not first:
                         continue
                     if "HYPERLINK" in first:
-                        # Try to extract the display text from the formula: =HYPERLINK("url","display")
+                        # formula looks like: =HYPERLINK("url","display")
                         parts = first.split('"')
                         if len(parts) >= 4:
                             display = parts[3]
@@ -321,7 +284,7 @@ class GoogleSheetsService:
             new_rows: List[List[str]] = []
 
             for tender in tenders:
-                # Determine real numeric id if present
+                # determine real_id
                 real_id = ""
                 if getattr(tender, "tender_id", None) is not None:
                     real_id = str(getattr(tender, "tender_id"))
@@ -330,22 +293,20 @@ class GoogleSheetsService:
 
                 display_id = real_id or ""
                 if display_id and display_id in existing_ids:
+                    logger.debug("Skipping existing tender id: %s", display_id)
                     continue
 
-                display_text = real_id or tender.name or ""
-
-                # Build URL using last 6 digits but display FULL real_id
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    url = f"https://tender.mc.uz/tender-list/tender/{last6}/view"
-                
-                    # Escape quotes just in case
+                    url = f"{base_url}{last6}/view"
                     safe_display = real_id.replace('"', '""')
-                
                     tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
                 else:
                     tender_link = ""
 
+                logger.debug("Prepared tender_link (add): %s", tender_link)
+
+                # Price / discount
                 start_price_decimal: Optional[Decimal] = None
                 if tender.start_price:
                     try:
@@ -388,32 +349,20 @@ class GoogleSheetsService:
             return False
 
     def get_tender_count(self) -> int:
-        """Get the total number of tenders in the spreadsheet.
-
-        Returns:
-            Number of tender records (excluding header)
-        """
         worksheet = self._get_worksheet()
         if not worksheet:
             return 0
-
         try:
             all_values = worksheet.get_all_values()
-            return max(0, len(all_values) - 1)  # Exclude header
+            return max(0, len(all_values) - 1)
         except Exception as e:
             logger.exception("Error getting tender count: %s", e)
             return 0
 
     def clear_all_data(self) -> bool:
-        """Clear all tender data (keeping headers).
-
-        Returns:
-            True if successful, False otherwise
-        """
         worksheet = self._get_worksheet()
         if not worksheet:
             return False
-
         try:
             worksheet.batch_clear([_CLEAR_RANGE])
             logger.info("Cleared all tender data from spreadsheet")
@@ -423,11 +372,6 @@ class GoogleSheetsService:
             return False
 
     def is_configured(self) -> bool:
-        """Check if Google Sheets service is properly configured.
-
-        Returns:
-            True if credentials and spreadsheet ID are available
-        """
         has_credentials = os.getenv("GOOGLE_CREDENTIALS_JSON") is not None or (
             self.credentials_path is not None and self.credentials_path.exists()
         )
@@ -435,7 +379,6 @@ class GoogleSheetsService:
 
 
 def create_sample_credentials_file() -> None:
-    """Create a sample Google credentials file for user reference."""
     sample_creds = {
         "type": "service_account",
         "project_id": "your-project-id",
@@ -448,11 +391,9 @@ def create_sample_credentials_file() -> None:
         "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/your-service-account%40your-project.iam.gserviceaccount.com",
     }
-
     sample_path = Path("google_credentials_sample.json")
     with open(sample_path, "w", encoding="utf-8") as f:
         json.dump(sample_creds, f, indent=2)
-
     print(f"Sample credentials file created: {sample_path}")
     print("\nTo set up Google Sheets integration:")
     print("1. Go to Google Cloud Console (https://console.cloud.google.com/)")
