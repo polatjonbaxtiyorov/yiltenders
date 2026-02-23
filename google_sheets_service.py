@@ -28,7 +28,7 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# Column headers for the spreadsheet
+# Column headers for the spreadsheet (row 1)
 HEADERS = [
     "Лот рақами",
     "Лойиҳа номи",
@@ -42,7 +42,7 @@ HEADERS = [
     "Буюртмачи",
 ]
 
-# Column range helper (A..J for 10 headers)
+# Range used for clearing data (A2..J1000 covers ten columns)
 _CLEAR_RANGE = "A2:J1000"
 
 
@@ -63,7 +63,6 @@ class GoogleSheetsService:
             worksheet_name: Name of the worksheet to use
         """
         self.credentials_path = Path(credentials_path) if credentials_path else Path("google_credentials.json")
-        # Priority: provided spreadsheet_id -> env var -> built-in default (if any)
         self.spreadsheet_id = (
             spreadsheet_id
             or os.getenv("GOOGLE_SPREADSHEET_ID")
@@ -112,74 +111,6 @@ class GoogleSheetsService:
             logger.exception("Unexpected error during authentication: %s", e)
             return False
 
-   def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
-    """Completely replace all data in sheet with fresh tenders."""
-
-    worksheet = self._get_worksheet()
-    if not worksheet:
-        return False
-
-    try:
-        # Clear all data except header
-        worksheet.batch_clear(["A2:J1000"])
-
-        # Rewrite header row (safety)
-        worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
-
-        base_url = "https://tender.mc.uz/tender-list/tender/"
-
-        new_rows = []
-
-        for tender in tenders:
-            tender_id = tender.unique_name or ""
-
-            # Create clickable hyperlink
-            if tender_id:
-                tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
-            else:
-                tender_link = ""
-
-            # Convert start_price to Decimal
-            start_price_decimal = None
-            if tender.start_price:
-                try:
-                    start_price_decimal = Decimal(str(tender.start_price))
-                except (ValueError, TypeError):
-                    start_price_decimal = None
-
-            discount_percent = None
-            final_price = None
-
-            if start_price_decimal and getattr(tender, "required_percent", None):
-                discount_percent = _discount_percent(start_price_decimal)
-                if discount_percent:
-                    final_price = start_price_decimal - (start_price_decimal * discount_percent)
-
-            row = [
-                tender_link,
-                tender.name or "",
-                tender.address or "",
-                tender.start_price or "",
-                str(discount_percent) if discount_percent else "",
-                str(final_price) if final_price else "",
-                str(tender.complexity_category_id) if getattr(tender, "complexity_category_id", None) else "",
-                tender.placement_term or "",
-                str(tender.end_term_work_days) if getattr(tender, "end_term_work_days", None) else "",
-                tender.customer_name or "",
-            ]
-
-            new_rows.append(row)
-
-        if new_rows:
-            worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-
-        logger.info(f"Replaced sheet with {len(new_rows)} tenders")
-        return True
-
-    except Exception as e:
-        logger.error(f"Error replacing sheet data: {e}")
-        return False
-
     def _get_worksheet(self) -> Optional[gspread.Worksheet]:
         """Get or create the worksheet.
 
@@ -195,6 +126,7 @@ class GoogleSheetsService:
                 logger.error("No spreadsheet ID provided")
                 return None
 
+            logger.debug("Using spreadsheet ID: %s", self.spreadsheet_id)
             spreadsheet = self._client.open_by_key(self.spreadsheet_id)
 
             # Try to get existing worksheet
@@ -205,8 +137,6 @@ class GoogleSheetsService:
                 # Create new worksheet
                 worksheet = spreadsheet.add_worksheet(title=self.worksheet_name, rows=1000, cols=len(HEADERS))
                 logger.info("Created new worksheet: %s", self.worksheet_name)
-
-                # Add headers
                 try:
                     worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
                     logger.info("Added headers to new worksheet")
@@ -224,7 +154,6 @@ class GoogleSheetsService:
             error_type = type(e).__name__
             logger.error("Error accessing worksheet: %s: %s", error_type, error_msg)
 
-            # Provide more helpful error messages when possible
             if "403" in error_msg or "Forbidden" in error_msg:
                 logger.error("Permission denied. Please share the spreadsheet with the service account.")
                 try:
@@ -243,90 +172,190 @@ class GoogleSheetsService:
             logger.exception("Full exception details:")
             return None
 
-   def add_tenders(self, tenders: List[TenderSummary]) -> bool:
-    """Add new tender data to the spreadsheet."""
+    def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
+        """Completely replace all data in sheet with fresh tenders.
 
-    if not tenders:
-        logger.info("No tenders to add to spreadsheet")
-        return True
+        This clears existing data (keeping header row) and appends all provided tenders.
+        """
+        worksheet = self._get_worksheet()
+        if not worksheet:
+            return False
 
-    worksheet = self._get_worksheet()
-    if not worksheet:
-        return False
-
-    try:
-        # Fetch existing IDs (column A)
-        existing_ids = set()
         try:
-            existing_data = worksheet.get_all_values()[1:]
-            for row in existing_data:
-                if row and row[0]:
-                    # Extract ID from HYPERLINK formula if present
-                    if "HYPERLINK" in row[0]:
-                        # Extract text between last quotes
-                        parts = row[0].split('"')
-                        if len(parts) >= 4:
-                            existing_ids.add(parts[3])
-                    else:
-                        existing_ids.add(row[0])
-        except Exception as e:
-            logger.warning(f"Could not fetch existing data: {e}")
-
-        base_url = "https://tender.mc.uz/tender-list/tender/"
-        new_rows = []
-
-        for tender in tenders:
-            tender_id = tender.unique_name or ""
-
-            if tender_id and tender_id in existing_ids:
-                continue
-
-            if tender_id:
-                tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
-            else:
-                tender_link = ""
-
-            start_price_decimal = None
-            if tender.start_price:
+            # Clear existing data (except header)
+            try:
+                worksheet.batch_clear([_CLEAR_RANGE])
+            except Exception:
+                # Fall back to clear if batch_clear not allowed in some states
                 try:
-                    start_price_decimal = Decimal(str(tender.start_price))
-                except (ValueError, TypeError):
-                    start_price_decimal = None
+                    worksheet.clear()
+                except Exception:
+                    logger.warning("Failed to clear worksheet cleanly; continuing to attempt to write anyway")
 
-            discount_percent = None
-            final_price = None
+            # Ensure header exists (overwrite first row)
+            try:
+                worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
+            except Exception:
+                try:
+                    worksheet.append_row(HEADERS, value_input_option="USER_ENTERED")
+                except Exception:
+                    logger.warning("Failed to write header row; continuing")
 
-            if start_price_decimal and getattr(tender, "required_percent", None):
-                discount_percent = _discount_percent(start_price_decimal)
-                if discount_percent:
-                    final_price = start_price_decimal - (start_price_decimal * discount_percent)
+            base_url = "https://tender.mc.uz/tender-list/tender/"
+            new_rows: List[List[str]] = []
 
-            row = [
-                tender_link,
-                tender.name or "",
-                tender.address or "",
-                tender.start_price or "",
-                str(discount_percent) if discount_percent else "",
-                str(final_price) if final_price else "",
-                str(tender.complexity_category_id) if getattr(tender, "complexity_category_id", None) else "",
-                tender.placement_term or "",
-                str(tender.end_term_work_days) if getattr(tender, "end_term_work_days", None) else "",
-                tender.customer_name or "",
-            ]
+            for tender in tenders:
+                tender_id = tender.unique_name or ""
 
-            new_rows.append(row)
+                # Create clickable hyperlink for the ID column
+                if tender_id:
+                    tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
+                else:
+                    tender_link = ""
 
-        if not new_rows:
-            logger.info("No new tenders to add")
+                # Convert start_price to Decimal when possible
+                start_price_decimal: Optional[Decimal] = None
+                if tender.start_price:
+                    try:
+                        start_price_decimal = Decimal(str(tender.start_price))
+                    except (ValueError, TypeError):
+                        start_price_decimal = None
+
+                discount_percent = None
+                final_price = None
+                if start_price_decimal and getattr(tender, "required_percent", None):
+                    discount_percent = _discount_percent(start_price_decimal)
+                    if discount_percent:
+                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
+
+                row = [
+                    tender_link,
+                    tender.name or "",
+                    tender.address or "",
+                    tender.start_price or "",
+                    str(discount_percent) if discount_percent else "",
+                    str(final_price) if final_price else "",
+                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
+                    tender.placement_term or "",
+                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
+                    tender.customer_name or "",
+                ]
+                new_rows.append(row)
+
+            if new_rows:
+                worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+
+            # Sanity check: log number of rows now present
+            try:
+                total_rows = len(worksheet.get_all_values())
+                logger.info("Sheet now contains %d rows (including header)", total_rows)
+            except Exception:
+                logger.debug("Could not fetch sheet row count after replace")
+
+            logger.info("Replaced sheet with %d tenders", len(new_rows))
             return True
 
-        worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
-        logger.info(f"Added {len(new_rows)} new tenders to spreadsheet")
-        return True
+        except Exception as e:
+            logger.exception("Error replacing sheet data: %s", e)
+            return False
 
-    except Exception as e:
-        logger.error(f"Error adding tenders to spreadsheet: {e}")
-        return False
+    def add_tenders(self, tenders: List[TenderSummary]) -> bool:
+        """Add new tender data to the spreadsheet.
+
+        Args:
+            tenders: List of TenderSummary objects to add
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not tenders:
+            logger.info("No tenders to add to spreadsheet")
+            return True
+
+        worksheet = self._get_worksheet()
+        if not worksheet:
+            return False
+
+        try:
+            # Fetch existing IDs (column A), try to handle HYPERLINK formulas
+            existing_ids = set()
+            try:
+                existing_data = worksheet.get_all_values()[1:]  # Skip header row
+                for row in existing_data:
+                    if not row:
+                        continue
+                    first = row[0]
+                    if not first:
+                        continue
+                    if "HYPERLINK" in first:
+                        # Try to extract the display text from the formula: "...", "display"
+                        parts = first.split('"')
+                        # typical formula: =HYPERLINK("url","display")
+                        if len(parts) >= 4:
+                            display = parts[3]
+                            existing_ids.add(display)
+                        else:
+                            existing_ids.add(first)
+                    else:
+                        existing_ids.add(first)
+            except Exception as e:
+                logger.warning("Could not fetch existing data: %s", e)
+
+            base_url = "https://tender.mc.uz/tender-list/tender/"
+            new_rows: List[List[str]] = []
+
+            for tender in tenders:
+                tender_id = tender.unique_name or ""
+
+                # Skip if already exists
+                if tender_id and tender_id in existing_ids:
+                    continue
+
+                if tender_id:
+                    tender_link = f'=HYPERLINK("{base_url}{tender_id}/view", "{tender_id}")'
+                else:
+                    tender_link = ""
+
+                start_price_decimal: Optional[Decimal] = None
+                if tender.start_price:
+                    try:
+                        start_price_decimal = Decimal(str(tender.start_price))
+                    except (ValueError, TypeError):
+                        start_price_decimal = None
+
+                discount_percent = None
+                final_price = None
+                if start_price_decimal and getattr(tender, "required_percent", None):
+                    discount_percent = _discount_percent(start_price_decimal)
+                    if discount_percent:
+                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
+
+                row = [
+                    tender_link,
+                    tender.name or "",
+                    tender.address or "",
+                    tender.start_price or "",
+                    str(discount_percent) if discount_percent else "",
+                    str(final_price) if final_price else "",
+                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
+                    tender.placement_term or "",
+                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
+                    tender.customer_name or "",
+                ]
+
+                new_rows.append(row)
+
+            if not new_rows:
+                logger.info("No new tenders to add (all already exist)")
+                return True
+
+            worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
+            logger.info("Added %d new tenders to spreadsheet", len(new_rows))
+            return True
+
+        except Exception as e:
+            logger.exception("Error adding tenders to spreadsheet: %s", e)
+            return False
 
     def get_tender_count(self) -> int:
         """Get the total number of tenders in the spreadsheet.
@@ -374,7 +403,7 @@ class GoogleSheetsService:
         )
         return bool(has_credentials and self.spreadsheet_id)
 
-# Utility to help users create a sample credentials file when running module directly
+
 def create_sample_credentials_file() -> None:
     """Create a sample Google credentials file for user reference."""
     sample_creds = {
