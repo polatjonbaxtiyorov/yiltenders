@@ -245,9 +245,13 @@ class GoogleSheetsService:
                 return True
                 
             # Add new rows to spreadsheet
-            worksheet.append_rows(new_rows)
-            logger.info(f"Added {len(new_rows)} new tenders to spreadsheet")
-            return True
+            try:
+                result = worksheet.append_rows(new_rows)
+                logger.info(f"Append API response: {result}")
+                logger.info(f"Added {len(new_rows)} new tenders to spreadsheet")
+            except Exception as e:
+                logger.error(f"FAILED to append rows: {type(e).__name__}: {e}")
+                return False
             
         except Exception as e:
             logger.error(f"Error adding tenders to spreadsheet: {e}")
