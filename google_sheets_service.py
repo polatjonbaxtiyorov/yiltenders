@@ -225,9 +225,9 @@ class GoogleSheetsService:
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
                     full_link = f"{base_url}{last6}/view"
-                    tender_link = f'=HYPERLINK("{full_link}", "{display_text}")'
+                    tender_link = f'=HYPERLINK("{full_link}", "{real_id}")'
                 else:
-                    tender_link = display_text
+                    tender_link = real_id
 
                 # Convert start_price to Decimal when possible
                 start_price_decimal: Optional[Decimal] = None
@@ -337,9 +337,9 @@ class GoogleSheetsService:
                 if real_id:
                     last6 = real_id[-6:] if len(real_id) >= 6 else real_id
                     full_link = f"{base_url}{last6}/view"
-                    tender_link = f'=HYPERLINK("{full_link}", "{display_text}")'
+                    tender_link = f'=HYPERLINK("{full_link}", "{real_id}")'
                 else:
-                    tender_link = display_text
+                    tender_link = real_id
 
                 start_price_decimal: Optional[Decimal] = None
                 if tender.start_price:
