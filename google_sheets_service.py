@@ -2,6 +2,11 @@
 
 This module provides functionality to automatically update Google Sheets
 with new tender data at regular intervals.
+
+Revisions:
+- Hyperlink in column A will display the full tender ID (if available)
+  but the URL path will use the **last 6 digits** of the ID as requested,
+  e.g. display "26411012225390" but link to ".../225390/view".
 """
 
 from __future__ import annotations
@@ -175,6 +180,8 @@ class GoogleSheetsService:
         """Completely replace all data in sheet with fresh tenders.
 
         This clears existing data (keeping header row) and appends all provided tenders.
+        The hyperlink in column A will display the full ID (if available) but the URL
+        will use the last 6 digits of that ID in the path as requested.
         """
         worksheet = self._get_worksheet()
         if not worksheet:
@@ -200,14 +207,24 @@ class GoogleSheetsService:
                 except Exception:
                     logger.warning("Failed to write header row; continuing")
 
+            base_url = "https://tender.mc.uz/tender-list/tender/"
             new_rows: List[List[str]] = []
 
             for tender in tenders:
-                # Use actual link if provided by scraper (preferred)
-                full_link = getattr(tender, "link", "") or getattr(tender, "url", "") or ""
-                display_text = tender.unique_name or getattr(tender, "id", "") or tender.name or ""
+                # Determine real numeric id if present
+                real_id = ""
+                if getattr(tender, "tender_id", None):
+                    real_id = str(getattr(tender, "tender_id"))
+                elif getattr(tender, "unique_name", None):
+                    # fallback to unique_name if tender_id missing
+                    real_id = str(getattr(tender, "unique_name"))
 
-                if full_link:
+                display_text = real_id or tender.name or ""
+
+                # Build link using last 6 digits of the real id (if any)
+                if real_id:
+                    last6 = real_id[-6:] if len(real_id) >= 6 else real_id
+                    full_link = f"{base_url}{last6}/view"
                     tender_link = f'=HYPERLINK("{full_link}", "{display_text}")'
                 else:
                     tender_link = display_text
@@ -299,17 +316,27 @@ class GoogleSheetsService:
             except Exception as e:
                 logger.warning("Could not fetch existing data: %s", e)
 
+            base_url = "https://tender.mc.uz/tender-list/tender/"
             new_rows: List[List[str]] = []
 
             for tender in tenders:
-                display_id = tender.unique_name or getattr(tender, "id", "") or ""
+                # Determine real numeric id if present
+                real_id = ""
+                if getattr(tender, "tender_id", None):
+                    real_id = str(getattr(tender, "tender_id"))
+                elif getattr(tender, "unique_name", None):
+                    real_id = str(getattr(tender, "unique_name"))
+
+                display_id = real_id or ""
                 if display_id and display_id in existing_ids:
                     continue
 
-                full_link = getattr(tender, "link", "") or getattr(tender, "url", "") or ""
-                display_text = tender.unique_name or getattr(tender, "id", "") or tender.name or ""
+                display_text = real_id or tender.name or ""
 
-                if full_link:
+                # Build link using last 6 digits of the real id (if any)
+                if real_id:
+                    last6 = real_id[-6:] if len(real_id) >= 6 else real_id
+                    full_link = f"{base_url}{last6}/view"
                     tender_link = f'=HYPERLINK("{full_link}", "{display_text}")'
                 else:
                     tender_link = display_text
