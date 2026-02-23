@@ -110,7 +110,64 @@ class GoogleSheetsService:
         except Exception as e:
             logger.error(f"Unexpected error during authentication: {e}")
             return False
+
+    def replace_all_tenders(self, tenders: List[TenderSummary]) -> bool:
+    """Completely replace all data in sheet with fresh tenders."""
     
+    worksheet = self._get_worksheet()
+    if not worksheet:
+        return False
+
+    try:
+        # Clear everything except header
+        worksheet.clear()
+        worksheet.append_row(HEADERS)
+
+        new_rows = []
+
+        for tender in tenders:
+            tender_id = str(tender.tender_id) if tender.tender_id else tender.unique_name or ""
+
+            start_price_decimal = None
+            if tender.start_price:
+                try:
+                    start_price_decimal = Decimal(str(tender.start_price))
+                except:
+                    pass
+
+            discount_percent = None
+            final_price = None
+
+            if start_price_decimal and tender.required_percent:
+                discount_percent = _discount_percent(start_price_decimal)
+                if discount_percent:
+                    final_price = start_price_decimal - (start_price_decimal * discount_percent)
+
+            row = [
+                tender.unique_name or "",
+                tender.name or "",
+                tender.address or "",
+                tender.start_price or "",
+                str(discount_percent) if discount_percent else "",
+                str(final_price) if final_price else "",
+                str(tender.complexity_category_id) if tender.complexity_category_id else "",
+                tender.placement_term or "",
+                str(tender.end_term_work_days) if tender.end_term_work_days else "",
+                tender.customer_name or "",
+            ]
+
+            new_rows.append(row)
+
+        if new_rows:
+            worksheet.append_rows(new_rows)
+
+        logger.info(f"Replaced sheet with {len(new_rows)} tenders")
+        return True
+
+    except Exception as e:
+        logger.error(f"Error replacing sheet data: {e}")
+        return False
+        
     def _get_worksheet(self) -> Optional[gspread.Worksheet]:
         """Get or create the worksheet.
         
