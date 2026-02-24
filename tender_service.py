@@ -7,9 +7,10 @@ payload.
 Behavior notes:
 - Keeps original region-based and nationwide filters.
 - Adds an OPTIONAL AVTOMOBIL keyword filter (require_avtomobil flag).
-- fetch_required_batches() has been updated to **expand** scope:
-  for each payload it collects both (a) normal results and (b) AVTOMOBIL results,
-  merges them and deduplicates by the existing summary key logic.
+- fetch_required_batches() expands scope by collecting both:
+    - 'normal' results (existing rules), and
+    - 'avtomobil' results (AVTOMOBIL keyword)
+  then merging them and deduplicating by the existing summary key logic.
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 def _normalize_text(value: Optional[Any]) -> Optional[str]:
+    """Normalize string: decode escapes and normalize unicode NFC."""
     if value is None:
         return None
 
@@ -51,9 +53,13 @@ def _normalize_text(value: Optional[Any]) -> Optional[str]:
         try:
             text = codecs.decode(text, "unicode_escape")
         except Exception:
+            # keep original if decode fails
             pass
 
-    return unicodedata.normalize("NFC", text)
+    try:
+        return unicodedata.normalize("NFC", text)
+    except Exception:
+        return text
 
 
 @dataclass
@@ -81,8 +87,12 @@ class TenderService:
         self._timeout = timeout
 
     def _customer_contains_avtomobil(self, item: Dict[str, Any]) -> bool:
-        """Return True if the tender's customer name contains the AVTOMOBIL keyword."""
-        customer_name = item.get("customer", {}).get("name")
+        """Return True if the tender's customer name contains the AVTOMOBIL keyword.
+
+        This function normalizes several forms of apostrophes and whitespace to
+        make the check robust for Uzbek text variants.
+        """
+        customer_name = (item.get("customer") or {}).get("name")
         if not customer_name:
             return False
 
@@ -90,7 +100,24 @@ class TenderService:
         if not normalized:
             return False
 
-        return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized.lower()
+        # Defensive normalization: unify different apostrophes/quotes and spaces
+        normalized_lower = (
+            normalized
+            .replace("’", "'")
+            .replace("‘", "'")
+            .replace("`", "'")
+            .replace("ʹ", "'")
+            .replace("ʼ", "'")
+            .replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .strip()
+            .lower()
+        )
+
+        # also normalize multiple spaces
+        normalized_lower = " ".join(normalized_lower.split())
+
+        return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized_lower
 
     def fetch_raw(self, region_id: Optional[int] = None) -> Dict[str, Any]:
         params = DEFAULT_PARAMS.copy()
@@ -125,15 +152,24 @@ class TenderService:
         """
         Filter payload according to existing business rules and optional AVTOMOBIL keyword.
 
-        Args:
-            payload: API JSON payload
-            region_id: optional region filter (10 or 14)
-            require_avtomobil: if True, only keep items whose customer name contains 'AVTOMOBIL'
+        Behavior:
+        - If require_avtomobil is True -> IGNORE region/target-customer rules and
+          filter the entire payload by the AVTOMOBIL keyword (nationwide).
+        - Otherwise keep original logic:
+            - If region_id in REGION_ALLOWLIST -> filter by region customer keyword (YO`LLAR)
+            - Else -> keep only target customer id (TARGET_CUSTOMER_ID)
         """
         items = payload.get("result", {}).get("data", [])
         total_items = len(items)
-        logger.debug("Filtering %s items for region_id=%s", total_items, region_id)
+        logger.debug("Filtering %s items for region_id=%s (require_avtomobil=%s)", total_items, region_id, require_avtomobil)
 
+        # If AVTOMOBIL mode requested, ignore region and target-customer logic
+        if require_avtomobil:
+            filtered = [item for item in items if self._customer_contains_avtomobil(item)]
+            logger.info("AVTOMOBIL mode: kept %s of %s items (region ignored)", len(filtered), total_items)
+            return [self._into_summary(item) for item in filtered]
+
+        # For normal flow: enforce region validation if region_id specified
         if region_id is not None and region_id not in REGION_ALLOWLIST:
             raise ValueError(
                 f"Unsupported region_id={region_id}. Only {sorted(REGION_ALLOWLIST)} are allowed."
@@ -145,17 +181,13 @@ class TenderService:
         else:
             filtered = [item for item in items if self._is_target_customer(item)]
 
-        # NEW: apply AVTOMOBIL filter if requested (non-breaking; applied on top of existing)
-        if require_avtomobil:
-            filtered = [item for item in filtered if self._customer_contains_avtomobil(item)]
-
-        logger.info("After filtering, %s items remain", len(filtered))
+        logger.info("After filtering (normal mode), %s items remain", len(filtered))
         return [self._into_summary(item) for item in filtered]
 
     def fetch_required_batches(self) -> Tuple[List[TenderSummary], List[Dict[str, Any]]]:
         """Fetch region 10, region 14, and nationwide tenders in sequence.
 
-        This version **expands** scope by collecting both:
+        This version expands scope by collecting both:
           - 'normal' results (existing rules), and
           - 'avtomobil' results (AVTOMOBIL keyword)
         for each payload and merging them (deduplicated).
@@ -163,19 +195,20 @@ class TenderService:
         combined: Dict[str, TenderSummary] = {}
         payloads_with_meta: List[Dict[str, Any]] = []
 
+        # region-specific batches
         for region_id in sorted(REGION_ALLOWLIST):
             payload = self.fetch_raw(region_id=region_id)
             payloads_with_meta.append({"region_id": region_id, "payload": payload})
 
             # original results (no additional AVTOMOBIL restriction)
             normal = self.filter_payload(payload, region_id=region_id, require_avtomobil=False)
-            # additional AVTOMOBIL results
+            # additional AVTOMOBIL results (region ignored inside filter_payload)
             avtomobil = self.filter_payload(payload, region_id=region_id, require_avtomobil=True)
 
             self._merge_summaries(combined, normal)
             self._merge_summaries(combined, avtomobil)
 
-        # Nationwide
+        # Nationwide batch
         nationwide_payload = self.fetch_raw(region_id=None)
         payloads_with_meta.append({"region_id": None, "payload": nationwide_payload})
 
@@ -198,7 +231,7 @@ class TenderService:
             )
 
     def _into_summary(self, item: Dict[str, Any]) -> TenderSummary:
-        customer_name = item.get("customer", {}).get("name")
+        customer_name = (item.get("customer") or {}).get("name")
         return TenderSummary(
             tender_id=item.get("id"),
             name=_normalize_text(item.get("name")),
@@ -226,7 +259,7 @@ class TenderService:
         return f"{summary.name}|{summary.customer_name}|{summary.address}"
 
     def _region_customer_matches(self, item: Dict[str, Any]) -> bool:
-        customer_name = item.get("customer", {}).get("name")
+        customer_name = (item.get("customer") or {}).get("name")
         if not customer_name:
             return False
         normalized = _normalize_text(customer_name)
