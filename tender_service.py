@@ -22,6 +22,7 @@ API_URL = "https://apisitender.mc.uz/api/tenders"
 REGION_ALLOWLIST = {10, 14}
 TARGET_CUSTOMER_ID = 374
 REGION_CUSTOMER_KEYWORD = "YO`LLAR"
+ADDITIONAL_CUSTOMER_KEYWORD = "AVTOMOBIL"
 DEFAULT_PARAMS = {
     "per_page": 100,
     "page": 1,
@@ -73,6 +74,17 @@ class TenderService:
         self._session = session or requests.Session()
         self._timeout = timeout
 
+    def _customer_contains_avtomobil(self, item: Dict[str, Any]) -> bool:
+    customer_name = item.get("customer", {}).get("name")
+    if not customer_name:
+        return False
+
+    normalized = _normalize_text(customer_name)
+    if not normalized:
+        return False
+
+    return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized.lower()
+    
     def fetch_raw(self, region_id: Optional[int] = None) -> Dict[str, Any]:
         params = DEFAULT_PARAMS.copy()
         if region_id is not None:
@@ -98,21 +110,33 @@ class TenderService:
         return self.filter_payload(payload, region_id=region_id)
 
     def filter_payload(
-        self, payload: Dict[str, Any], region_id: Optional[int] = None
+        self,
+        payload: Dict[str, Any],
+        region_id: Optional[int] = None,
+        require_avtomobil: bool = False,  # NEW PARAMETER
     ) -> List[TenderSummary]:
+
         items = payload.get("result", {}).get("data", [])
         total_items = len(items)
         logger.debug("Filtering %s items for region_id=%s", total_items, region_id)
-
-        if region_id is not None and region_id not in REGION_ALLOWLIST:
+        
+        if region_id is not None and region_id not in REGION_ALLOWLIST:            
             raise ValueError(
                 f"Unsupported region_id={region_id}. Only {sorted(REGION_ALLOWLIST)} are allowed."
             )
 
+        # --- EXISTING LOGIC (unchanged) ---
         if region_id in REGION_ALLOWLIST:
             filtered = [item for item in items if self._region_customer_matches(item)]
         else:
             filtered = [item for item in items if self._is_target_customer(item)]
+        
+        # --- NEW ADDITIONAL FILTER ---
+        if require_avtomobil:
+            filtered = [
+                item for item in filtered
+                if self._customer_contains_avtomobil(item)
+            ]
 
         logger.info("After filtering, %s items remain", len(filtered))
         return [self._into_summary(item) for item in filtered]
@@ -126,12 +150,12 @@ class TenderService:
         for region_id in sorted(REGION_ALLOWLIST):
             payload = self.fetch_raw(region_id=region_id)
             payloads_with_meta.append({"region_id": region_id, "payload": payload})
-            summaries = self.filter_payload(payload, region_id=region_id)
+            summaries = self.filter_payload(payload, region_id=region_id, require_avtomobil=True)
             self._merge_summaries(combined, summaries)
 
         nationwide_payload = self.fetch_raw(region_id=None)
         payloads_with_meta.append({"region_id": None, "payload": nationwide_payload})
-        nationwide_summaries = self.filter_payload(nationwide_payload)
+        nationwide_summaries = self.filter_payload(nationwide_payload, require_avtomobil=True)
         self._merge_summaries(combined, nationwide_summaries)
 
         logger.info("Combined total summaries: %s", len(combined))
