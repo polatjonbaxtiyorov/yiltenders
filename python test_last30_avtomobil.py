@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from tender_service import TenderService
 
 def filter_last_30_days(items):
-    cutoff = datetime.utcnow() - timedelta(days=30)
+    cutoff = datetime.utcnow() - timedelta(days=60)
     result = []
 
     for item in items:
