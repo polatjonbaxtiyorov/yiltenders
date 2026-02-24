@@ -3,6 +3,13 @@
 This module calls the apisitender API, applies the business filtering rules
 requested by the customer, and shapes the response into a telegram-friendly
 payload.
+
+Behavior notes:
+- Keeps original region-based and nationwide filters.
+- Adds an OPTIONAL AVTOMOBIL keyword filter (require_avtomobil flag).
+- fetch_required_batches() has been updated to **expand** scope:
+  for each payload it collects both (a) normal results and (b) AVTOMOBIL results,
+  merges them and deduplicates by the existing summary key logic.
 """
 
 from __future__ import annotations
@@ -31,7 +38,6 @@ DEFAULT_PARAMS = {
     "order_by": "confirmed_date",
     "status": 2,
 }
-
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +81,17 @@ class TenderService:
         self._timeout = timeout
 
     def _customer_contains_avtomobil(self, item: Dict[str, Any]) -> bool:
-    customer_name = item.get("customer", {}).get("name")
-    if not customer_name:
-        return False
+        """Return True if the tender's customer name contains the AVTOMOBIL keyword."""
+        customer_name = item.get("customer", {}).get("name")
+        if not customer_name:
+            return False
 
-    normalized = _normalize_text(customer_name)
-    if not normalized:
-        return False
+        normalized = _normalize_text(customer_name)
+        if not normalized:
+            return False
 
-    return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized.lower()
-    
+        return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized.lower()
+
     def fetch_raw(self, region_id: Optional[int] = None) -> Dict[str, Any]:
         params = DEFAULT_PARAMS.copy()
         if region_id is not None:
@@ -113,52 +120,72 @@ class TenderService:
         self,
         payload: Dict[str, Any],
         region_id: Optional[int] = None,
-        require_avtomobil: bool = False,  # NEW PARAMETER
+        require_avtomobil: bool = False,
     ) -> List[TenderSummary]:
+        """
+        Filter payload according to existing business rules and optional AVTOMOBIL keyword.
 
+        Args:
+            payload: API JSON payload
+            region_id: optional region filter (10 or 14)
+            require_avtomobil: if True, only keep items whose customer name contains 'AVTOMOBIL'
+        """
         items = payload.get("result", {}).get("data", [])
         total_items = len(items)
         logger.debug("Filtering %s items for region_id=%s", total_items, region_id)
-        
-        if region_id is not None and region_id not in REGION_ALLOWLIST:            
+
+        if region_id is not None and region_id not in REGION_ALLOWLIST:
             raise ValueError(
                 f"Unsupported region_id={region_id}. Only {sorted(REGION_ALLOWLIST)} are allowed."
             )
 
-        # --- EXISTING LOGIC (unchanged) ---
+        # EXISTING LOGIC: region vs nationwide filters
         if region_id in REGION_ALLOWLIST:
             filtered = [item for item in items if self._region_customer_matches(item)]
         else:
             filtered = [item for item in items if self._is_target_customer(item)]
-        
-        # --- NEW ADDITIONAL FILTER ---
+
+        # NEW: apply AVTOMOBIL filter if requested (non-breaking; applied on top of existing)
         if require_avtomobil:
-            filtered = [
-                item for item in filtered
-                if self._customer_contains_avtomobil(item)
-            ]
+            filtered = [item for item in filtered if self._customer_contains_avtomobil(item)]
 
         logger.info("After filtering, %s items remain", len(filtered))
         return [self._into_summary(item) for item in filtered]
 
     def fetch_required_batches(self) -> Tuple[List[TenderSummary], List[Dict[str, Any]]]:
-        """Fetch region 10, region 14, and nationwide tenders in sequence."""
+        """Fetch region 10, region 14, and nationwide tenders in sequence.
 
+        This version **expands** scope by collecting both:
+          - 'normal' results (existing rules), and
+          - 'avtomobil' results (AVTOMOBIL keyword)
+        for each payload and merging them (deduplicated).
+        """
         combined: Dict[str, TenderSummary] = {}
         payloads_with_meta: List[Dict[str, Any]] = []
 
         for region_id in sorted(REGION_ALLOWLIST):
             payload = self.fetch_raw(region_id=region_id)
             payloads_with_meta.append({"region_id": region_id, "payload": payload})
-            summaries = self.filter_payload(payload, region_id=region_id, require_avtomobil=True)
-            self._merge_summaries(combined, summaries)
 
+            # original results (no additional AVTOMOBIL restriction)
+            normal = self.filter_payload(payload, region_id=region_id, require_avtomobil=False)
+            # additional AVTOMOBIL results
+            avtomobil = self.filter_payload(payload, region_id=region_id, require_avtomobil=True)
+
+            self._merge_summaries(combined, normal)
+            self._merge_summaries(combined, avtomobil)
+
+        # Nationwide
         nationwide_payload = self.fetch_raw(region_id=None)
         payloads_with_meta.append({"region_id": None, "payload": nationwide_payload})
-        nationwide_summaries = self.filter_payload(nationwide_payload, require_avtomobil=True)
-        self._merge_summaries(combined, nationwide_summaries)
 
-        logger.info("Combined total summaries: %s", len(combined))
+        normal = self.filter_payload(nationwide_payload, require_avtomobil=False)
+        avtomobil = self.filter_payload(nationwide_payload, require_avtomobil=True)
+
+        self._merge_summaries(combined, normal)
+        self._merge_summaries(combined, avtomobil)
+
+        logger.info("Combined total summaries (expanded scope): %s", len(combined))
         return list(combined.values()), payloads_with_meta
 
     def _is_target_customer(self, item: Dict[str, Any]) -> bool:
@@ -253,7 +280,6 @@ def _format_percent(value: Optional[Decimal]) -> str:
 
 def format_for_telegram(tenders: Iterable[TenderSummary]) -> List[str]:
     """Return human-readable snippets ready to send to Telegram."""
-
     lines: List[str] = []
     for tender in tenders:
         price = _parse_price(tender.start_price)
@@ -333,9 +359,7 @@ def main() -> None:
 
     if args.show_response:
         for meta in payloads_with_meta:
-            header = (
-                f"=== Server response for region_id={meta['region_id']} ==="
-            )
+            header = f"=== Server response for region_id={meta['region_id']} ==="
             print(header)
             print(json.dumps(meta["payload"], ensure_ascii=False, indent=2))
             print()
