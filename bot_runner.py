@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
@@ -26,7 +27,8 @@ COMMAND_SENDALL = "/sendall"
 COMMAND_REFRESH = "/refresh"
 COMMAND_STATUS = "/status"
 COMMAND_HELP = "/help"
-COMMAND_SYNCALL = "/sync_all"     # <--- new command
+COMMAND_SYNCALL = "/sync_all"
+COMMAND_TEST30 = "/test30"
 
 
 def get_help_message(has_sheets: bool = False) -> str:
@@ -35,6 +37,7 @@ def get_help_message(has_sheets: bool = False) -> str:
 
 /sendall - Barcha saqlangan tenderlarni ko'rish
 /refresh - Yangi tenderlarni qidirish va yuborish
+/test30 - Test: so'nggi 30 kun + AVTOMOBIL mijozlari (faqat sizga yuboradi)
 /help - Bu yordam xabarini ko'rsatish"""
     
     if has_sheets:
@@ -383,6 +386,9 @@ class TelegramUpdatePoller:
         elif text == COMMAND_SYNCALL and self._has_sheets:
             # New handler for /sync_all
             self._handle_sync_all(chat_id)
+        elif text == COMMAND_TEST30:
+            # Test-only command (last 30 days + AVTOMOBIL), safe: does not modify store/sheets
+            self._handle_test30(chat_id)
         elif text == COMMAND_HELP or text.startswith("/"):
             self._send_help(chat_id)
         else:
@@ -464,6 +470,102 @@ class TelegramUpdatePoller:
         except Exception as e:
             logging.exception("Error during /sync_all: %s", e)
             self._notifier.send_messages([chat_id], [f"❌ Xatolik yuz berdi: {str(e)}"])
+
+    def _handle_test30(self, chat_id: str) -> None:
+        """Temporary test: last 30 days + AVTOMOBIL filter.
+
+        This is a read-only test. It:
+         - fetches raw API responses for regions (10, 14) and nationwide,
+         - keeps only items with confirmed_date in last 30 days,
+         - keeps only items whose customer name contains "AVTOMOBIL" (case-insensitive),
+         - deduplicates using TenderService._summary_key and returns results to the requester.
+
+        Does NOT modify store or sheets.
+        """
+        self._notifier.send_messages([chat_id], ["🧪 Testing: Last 30 days + AVTOMOBIL filter..."])
+
+        try:
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            combined: dict[str, TenderSummary] = {}
+
+            region_ids = [10, 14, None]  # same order as your existing fetch flow
+            for region_id in region_ids:
+                try:
+                    payload = self._service.fetch_raw(region_id=region_id)
+                except Exception as e:
+                    logging.exception("Failed to fetch region %s: %s", region_id, e)
+                    continue
+
+                items = payload.get("result", {}).get("data", []) or []
+                for item in items:
+                    confirmed = item.get("confirmed_date")
+                    if not confirmed:
+                        continue
+                    try:
+                        # parse common ISO-like formats; adjust if your API uses another format
+                        confirmed_dt = datetime.fromisoformat(confirmed.replace("Z", "+00:00"))
+                    except Exception:
+                        # If parse fails, skip (safe approach for test)
+                        continue
+                    if confirmed_dt < cutoff:
+                        continue
+
+                    # Check customer name contains "AVTOMOBIL" (case-insensitive)
+                    customer_name = (item.get("customer") or {}).get("name") or ""
+                    if not customer_name:
+                        continue
+                    if "avtomobil" not in customer_name.lower():
+                        continue
+
+                    # Convert to TenderSummary using existing method
+                    try:
+                        summary = self._service._into_summary(item)
+                    except Exception:
+                        # fallback: build a minimal summary
+                        summary = TenderSummary(
+                            tender_id=item.get("id"),
+                            name=item.get("name"),
+                            unique_name=item.get("unique_name"),
+                            start_price=item.get("start_price"),
+                            required_percent=item.get("required_percent"),
+                            placement_term=item.get("placement_term"),
+                            complexity_category_id=item.get("complexity_category_id"),
+                            end_term_work_days=item.get("end_term_work_days"),
+                            customer_name=(item.get("customer") or {}).get("name"),
+                            address=item.get("address"),
+                        )
+
+                    # Deduplicate by summary key
+                    try:
+                        key = self._service._summary_key(summary)
+                    except Exception:
+                        # fallback key
+                        key = summary.unique_name or f"{summary.name}|{summary.customer_name}|{summary.address}"
+
+                    if key not in combined:
+                        combined[key] = summary
+
+            summaries = list(combined.values())
+            if not summaries:
+                self._notifier.send_messages([chat_id], ["❌ No tenders found for last 30 days with AVTOMOBIL filter."])
+                return
+
+            # Convert summaries to telegram messages
+            messages = format_for_telegram(summaries)
+
+            # Send header + up to a reasonable number of messages (to avoid hitting Telegram limits)
+            self._notifier.send_messages([chat_id], [f"✅ Found {len(summaries)} tenders (last 30 days + AVTOMOBIL). Sending results..."])
+
+            # Telegram has message length limits — send in batches
+            # We'll send each formatted block separately (your format_for_telegram already returns blocks)
+            for msg in messages:
+                self._notifier.send_messages([chat_id], [msg])
+
+            self._notifier.send_messages([chat_id], ["✅ Test complete. This was a read-only check."])
+
+        except Exception as e:
+            logging.exception("Test30 failed")
+            self._notifier.send_messages([chat_id], [f"❌ Error during test: {str(e)}"])
 
     def _send_help(self, chat_id: str) -> None:
         """Send help message to user."""
