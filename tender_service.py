@@ -53,7 +53,6 @@ def _normalize_text(value: Optional[Any]) -> Optional[str]:
         try:
             text = codecs.decode(text, "unicode_escape")
         except Exception:
-            # keep original if decode fails
             pass
 
     try:
@@ -87,11 +86,6 @@ class TenderService:
         self._timeout = timeout
 
     def _customer_contains_avtomobil(self, item: Dict[str, Any]) -> bool:
-        """Return True if the tender's customer name contains the AVTOMOBIL keyword.
-
-        This function normalizes several forms of apostrophes and whitespace to
-        make the check robust for Uzbek text variants.
-        """
         customer_name = (item.get("customer") or {}).get("name")
         if not customer_name:
             return False
@@ -100,11 +94,10 @@ class TenderService:
         if not normalized:
             return False
 
-        # Defensive normalization: unify different apostrophes/quotes and spaces
         normalized_lower = (
             normalized
-            .replace("’", "'")
-            .replace("‘", "'")
+            .replace("'", "'")
+            .replace("'", "'")
             .replace("`", "'")
             .replace("ʹ", "'")
             .replace("ʼ", "'")
@@ -113,10 +106,7 @@ class TenderService:
             .strip()
             .lower()
         )
-
-        # also normalize multiple spaces
         normalized_lower = " ".join(normalized_lower.split())
-
         return ADDITIONAL_CUSTOMER_KEYWORD.lower() in normalized_lower
 
     def fetch_raw(self, region_id: Optional[int] = None) -> Dict[str, Any]:
@@ -149,33 +139,20 @@ class TenderService:
         region_id: Optional[int] = None,
         require_avtomobil: bool = False,
     ) -> List[TenderSummary]:
-        """
-        Filter payload according to existing business rules and optional AVTOMOBIL keyword.
-
-        Behavior:
-        - If require_avtomobil is True -> IGNORE region/target-customer rules and
-          filter the entire payload by the AVTOMOBIL keyword (nationwide).
-        - Otherwise keep original logic:
-            - If region_id in REGION_ALLOWLIST -> filter by region customer keyword (YO`LLAR)
-            - Else -> keep only target customer id (TARGET_CUSTOMER_ID)
-        """
         items = payload.get("result", {}).get("data", [])
         total_items = len(items)
         logger.debug("Filtering %s items for region_id=%s (require_avtomobil=%s)", total_items, region_id, require_avtomobil)
 
-        # If AVTOMOBIL mode requested, ignore region and target-customer logic
         if require_avtomobil:
             filtered = [item for item in items if self._customer_contains_avtomobil(item)]
             logger.info("AVTOMOBIL mode: kept %s of %s items (region ignored)", len(filtered), total_items)
             return [self._into_summary(item) for item in filtered]
 
-        # For normal flow: enforce region validation if region_id specified
         if region_id is not None and region_id not in REGION_ALLOWLIST:
             raise ValueError(
                 f"Unsupported region_id={region_id}. Only {sorted(REGION_ALLOWLIST)} are allowed."
             )
 
-        # EXISTING LOGIC: region vs nationwide filters
         if region_id in REGION_ALLOWLIST:
             filtered = [item for item in items if self._region_customer_matches(item)]
         else:
@@ -185,30 +162,19 @@ class TenderService:
         return [self._into_summary(item) for item in filtered]
 
     def fetch_required_batches(self) -> Tuple[List[TenderSummary], List[Dict[str, Any]]]:
-        """Fetch region 10, region 14, and nationwide tenders in sequence.
-
-        This version expands scope by collecting both:
-          - 'normal' results (existing rules), and
-          - 'avtomobil' results (AVTOMOBIL keyword)
-        for each payload and merging them (deduplicated).
-        """
         combined: Dict[str, TenderSummary] = {}
         payloads_with_meta: List[Dict[str, Any]] = []
 
-        # region-specific batches
         for region_id in sorted(REGION_ALLOWLIST):
             payload = self.fetch_raw(region_id=region_id)
             payloads_with_meta.append({"region_id": region_id, "payload": payload})
 
-            # original results (no additional AVTOMOBIL restriction)
             normal = self.filter_payload(payload, region_id=region_id, require_avtomobil=False)
-            # additional AVTOMOBIL results (region ignored inside filter_payload)
             avtomobil = self.filter_payload(payload, region_id=region_id, require_avtomobil=True)
 
             self._merge_summaries(combined, normal)
             self._merge_summaries(combined, avtomobil)
 
-        # Nationwide batch
         nationwide_payload = self.fetch_raw(region_id=None)
         payloads_with_meta.append({"region_id": None, "payload": nationwide_payload})
 
@@ -321,10 +287,15 @@ def format_for_telegram(tenders: Iterable[TenderSummary]) -> List[str]:
 
         if tender.tender_id is not None:
             tender_id_text = str(tender.tender_id)
-            link = f"https://tender.mc.uz/tender-list/tender/{tender_id_text}/view"
+            link = f"https://tender.mc.uz/tender-list/tender/{tender_id_text[-6:]}/view"
             id_line = f'<b>Лот рақами:</b> <a href="{link}">{tender.unique_name}</a>'
         else:
             id_line = f"<b>Лот рақами:</b> {tender.unique_name or '–'}"
+
+        # FIX: use 'is not None' for integer fields so that 0 is shown correctly,
+        # not swallowed by Python's falsy evaluation.
+        complexity_str = str(tender.complexity_category_id) if tender.complexity_category_id is not None else "–"
+        end_term_str = str(tender.end_term_work_days) if tender.end_term_work_days is not None else "–"
 
         block = (
             f"{id_line}\n"
@@ -333,9 +304,9 @@ def format_for_telegram(tenders: Iterable[TenderSummary]) -> List[str]:
             f"<b>Бошланғич нарх:</b> {_format_currency(price)}\n"
             f"<b>Чегирма:</b> {_format_percent(discount)}\n"
             f"<b>Таклиф нархи:</b> {_format_currency(offer_price)}\n"
-            f"<b>Мураккаблик тоифаси:</b> {tender.complexity_category_id or '–'}\n"
+            f"<b>Мураккаблик тоифаси:</b> {complexity_str}\n"
             f"<b>Таклифларни топширишнинг охирги муддати:</b> {tender.placement_term or '–'}\n"
-            f"<b>Ишларни бажариш муддати:</b> {tender.end_term_work_days or '–'} кун\n"
+            f"<b>Ишларни бажариш муддати:</b> {end_term_str} кун\n"
             f"<b>Буюртмачи:</b> {tender.customer_name or '–'}"
         )
         lines.append(block)
