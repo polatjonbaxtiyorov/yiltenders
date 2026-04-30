@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import json
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,13 +26,11 @@ from tender_service import _discount_percent, TenderSummary
 
 logger = logging.getLogger(__name__)
 
-# Default scopes for Google Sheets API
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.file",
 ]
 
-# Column headers for the spreadsheet (row 1)
 HEADERS = [
     "Лот рақами",
     "Лойиҳа номи",
@@ -46,8 +44,102 @@ HEADERS = [
     "Буюртмачи",
 ]
 
-# Range used for clearing data (A2..J1000 covers ten columns)
 _CLEAR_RANGE = "A2:J1000"
+
+
+def _parse_price(value: Optional[str]) -> Optional[Decimal]:
+    """Parse a price string into a Decimal, returning None on failure."""
+    if not value:
+        return None
+    text = str(value).replace(" ", "")
+    if not text:
+        return None
+    try:
+        return Decimal(text)
+    except (InvalidOperation, ValueError):
+        return None
+
+
+def _format_currency_sheet(amount: Optional[Decimal]) -> str:
+    """Format a Decimal price as a plain integer string for Sheets (e.g. '27950000')."""
+    if amount is None:
+        return ""
+    try:
+        return str(int(amount.quantize(Decimal("1"))))
+    except (InvalidOperation, ValueError):
+        return ""
+
+
+def _format_percent_sheet(value: Optional[Decimal]) -> str:
+    """Format a discount Decimal (e.g. 0.05) as '5%' for Sheets."""
+    if value is None:
+        return ""
+    try:
+        percent = int((value * 100).quantize(Decimal("1")))
+        return f"{percent}%"
+    except (InvalidOperation, ValueError):
+        return ""
+
+
+def _build_row(tender: TenderSummary, base_url: str) -> List[str]:
+    """Build a single sheet row from a TenderSummary.
+
+    FIX: discount and offer_price are now always calculated from start_price
+    using the threshold logic — the required_percent field from the API is
+    unreliable (often null) and was previously used as a gate, causing columns
+    E and F to be blank for most tenders.
+    """
+    # --- Lot link (column A) ---
+    real_id = ""
+    if getattr(tender, "tender_id", None) is not None:
+        real_id = str(tender.tender_id)
+    elif getattr(tender, "unique_name", None):
+        real_id = str(tender.unique_name)
+
+    if real_id:
+        last6 = real_id[-6:] if len(real_id) >= 6 else real_id
+        url = f"{base_url}{last6}/view"
+        safe_display = real_id.replace('"', '""')
+        tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
+    else:
+        tender_link = ""
+
+    # --- Price / discount (columns D, E, F) ---
+    # FIX: calculate purely from start_price — no required_percent gate.
+    start_price_decimal = _parse_price(tender.start_price)
+    discount_percent = _discount_percent(start_price_decimal)  # returns None if price is None
+    final_price = (
+        start_price_decimal - (start_price_decimal * discount_percent)
+        if start_price_decimal is not None and discount_percent is not None
+        else None
+    )
+
+    # --- Complexity / work days (columns G, I) ---
+    # FIX: use explicit None check so that integer value 0 is written correctly,
+    # not silently dropped by Python's falsy evaluation.
+    complexity_str = (
+        str(tender.complexity_category_id)
+        if tender.complexity_category_id is not None
+        else ""
+    )
+    end_term_str = (
+        str(tender.end_term_work_days)
+        if tender.end_term_work_days is not None
+        else ""
+    )
+
+    return [
+        tender_link,
+        tender.name or "",
+        tender.address or "",
+        _format_currency_sheet(start_price_decimal),
+        _format_percent_sheet(discount_percent),
+        _format_currency_sheet(final_price),
+        complexity_str,
+        tender.placement_term or "",
+        end_term_str,
+        tender.customer_name or "",
+    ]
 
 
 class GoogleSheetsService:
@@ -158,7 +250,6 @@ class GoogleSheetsService:
             return False
 
         try:
-            # Clear existing data (except header)
             try:
                 worksheet.batch_clear([_CLEAR_RANGE])
             except Exception:
@@ -167,7 +258,6 @@ class GoogleSheetsService:
                 except Exception:
                     logger.warning("Failed to clear worksheet cleanly; continuing")
 
-            # Ensure header exists
             try:
                 worksheet.update("A1", [HEADERS], value_input_option="USER_ENTERED")
             except Exception:
@@ -177,56 +267,7 @@ class GoogleSheetsService:
                     logger.warning("Failed to write header row; continuing")
 
             base_url = "https://tender.mc.uz/tender-list/tender/"
-            new_rows: List[List[str]] = []
-
-            for tender in tenders:
-                # --- determine real_id (FULL ID) ---
-                real_id = ""
-                if getattr(tender, "tender_id", None) is not None:
-                    real_id = str(getattr(tender, "tender_id"))
-                elif getattr(tender, "unique_name", None):
-                    real_id = str(getattr(tender, "unique_name"))
-
-                # Build URL with last6 but display full real_id
-                if real_id:
-                    last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    url = f"{base_url}{last6}/view"
-                    safe_display = real_id.replace('"', '""')
-                    tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
-                else:
-                    tender_link = ""
-
-                # Debug: log what we write for the first few tenders (or all in debug)
-                logger.debug("Prepared tender_link: %s", tender_link)
-
-                # Price / discount handling
-                start_price_decimal: Optional[Decimal] = None
-                if tender.start_price:
-                    try:
-                        start_price_decimal = Decimal(str(tender.start_price))
-                    except (ValueError, TypeError):
-                        start_price_decimal = None
-
-                discount_percent = None
-                final_price = None
-                if start_price_decimal and getattr(tender, "required_percent", None):
-                    discount_percent = _discount_percent(start_price_decimal)
-                    if discount_percent:
-                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
-
-                row = [
-                    tender_link,
-                    tender.name or "",
-                    tender.address or "",
-                    tender.start_price or "",
-                    str(discount_percent) if discount_percent else "",
-                    str(final_price) if final_price else "",
-                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
-                    tender.placement_term or "",
-                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
-                    tender.customer_name or "",
-                ]
-                new_rows.append(row)
+            new_rows = [_build_row(tender, base_url) for tender in tenders]
 
             if new_rows:
                 worksheet.append_rows(new_rows, value_input_option="USER_ENTERED")
@@ -247,7 +288,7 @@ class GoogleSheetsService:
             return False
 
     def add_tenders(self, tenders: List[TenderSummary]) -> bool:
-        """Add new tender data to the spreadsheet."""
+        """Add new tender data to the spreadsheet (skips already-existing IDs)."""
         if not tenders:
             logger.info("No tenders to add to spreadsheet")
             return True
@@ -258,7 +299,7 @@ class GoogleSheetsService:
 
         try:
             # Read existing display IDs from column A (handle HYPERLINK formulas)
-            existing_ids = set()
+            existing_ids: set = set()
             try:
                 existing_data = worksheet.get_all_values()[1:]  # skip header
                 for row in existing_data:
@@ -268,11 +309,9 @@ class GoogleSheetsService:
                     if not first:
                         continue
                     if "HYPERLINK" in first:
-                        # formula looks like: =HYPERLINK("url","display")
                         parts = first.split('"')
                         if len(parts) >= 4:
-                            display = parts[3]
-                            existing_ids.add(display)
+                            existing_ids.add(parts[3])
                         else:
                             existing_ids.add(first)
                     else:
@@ -284,57 +323,17 @@ class GoogleSheetsService:
             new_rows: List[List[str]] = []
 
             for tender in tenders:
-                # determine real_id
                 real_id = ""
                 if getattr(tender, "tender_id", None) is not None:
-                    real_id = str(getattr(tender, "tender_id"))
+                    real_id = str(tender.tender_id)
                 elif getattr(tender, "unique_name", None):
-                    real_id = str(getattr(tender, "unique_name"))
+                    real_id = str(tender.unique_name)
 
-                display_id = real_id or ""
-                if display_id and display_id in existing_ids:
-                    logger.debug("Skipping existing tender id: %s", display_id)
+                if real_id and real_id in existing_ids:
+                    logger.debug("Skipping existing tender id: %s", real_id)
                     continue
 
-                if real_id:
-                    last6 = real_id[-6:] if len(real_id) >= 6 else real_id
-                    url = f"{base_url}{last6}/view"
-                    safe_display = real_id.replace('"', '""')
-                    tender_link = f'=HYPERLINK("{url}", "{safe_display}")'
-                else:
-                    tender_link = ""
-
-                logger.debug("Prepared tender_link (add): %s", tender_link)
-
-                # Price / discount
-                start_price_decimal: Optional[Decimal] = None
-                if tender.start_price:
-                    try:
-                        start_price_decimal = Decimal(str(tender.start_price))
-                    except (ValueError, TypeError):
-                        start_price_decimal = None
-
-                discount_percent = None
-                final_price = None
-                if start_price_decimal and getattr(tender, "required_percent", None):
-                    discount_percent = _discount_percent(start_price_decimal)
-                    if discount_percent:
-                        final_price = start_price_decimal - (start_price_decimal * discount_percent)
-
-                row = [
-                    tender_link,
-                    tender.name or "",
-                    tender.address or "",
-                    tender.start_price or "",
-                    str(discount_percent) if discount_percent else "",
-                    str(final_price) if final_price else "",
-                    str(getattr(tender, "complexity_category_id", "")) if getattr(tender, "complexity_category_id", None) else "",
-                    tender.placement_term or "",
-                    str(getattr(tender, "end_term_work_days", "")) if getattr(tender, "end_term_work_days", None) else "",
-                    tender.customer_name or "",
-                ]
-
-                new_rows.append(row)
+                new_rows.append(_build_row(tender, base_url))
 
             if not new_rows:
                 logger.info("No new tenders to add (all already exist)")
@@ -395,14 +394,6 @@ def create_sample_credentials_file() -> None:
     with open(sample_path, "w", encoding="utf-8") as f:
         json.dump(sample_creds, f, indent=2)
     print(f"Sample credentials file created: {sample_path}")
-    print("\nTo set up Google Sheets integration:")
-    print("1. Go to Google Cloud Console (https://console.cloud.google.com/)")
-    print("2. Create a new project or select existing one")
-    print("3. Enable Google Sheets API and Google Drive API")
-    print("4. Create a Service Account and download the JSON key")
-    print("5. Rename the key file to 'google_credentials.json' or set GOOGLE_CREDENTIALS_JSON env var")
-    print("6. Share your Google Sheet with the service account email")
-    print("7. Optionally set GOOGLE_SPREADSHEET_ID env var or pass --spreadsheet-id to the test command")
 
 
 if __name__ == "__main__":
